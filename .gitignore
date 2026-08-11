@@ -1,0 +1,23 @@
+# 環境変数(APIキー)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+
+# LangGraph / LangChain
+.langgraph_api/
+.langsmith/
+
+# OS
+.DS_Store
+
+# エディタ
+.vscode/
+.idea/
