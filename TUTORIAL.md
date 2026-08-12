@@ -151,6 +151,76 @@ flowchart TD
     Writer --> Supervisor
 ```
 
+### 1回の実行で実際に起きている処理の流れ
+
+1. ユーザーの依頼(例:「〇〇についてレポートを作って」)が`messages`としてグラフに渡り、
+   最初に`supervisor`ノードが実行される。
+2. Supervisorは会話履歴全体を見て、「まだ情報が無いのでResearcherが必要」と判断し、
+   `next="Researcher"`を返す。
+3. 条件付きEdge(`add_conditional_edges`)がこの`next`の値を見て`Researcher`ノードへ遷移する。
+4. `Researcher`ノードは内部で`create_react_agent`(検索ツール付きのReActループ)を実行し、
+   検索結果を要約した内容を`[Researcher] ...`という形でメッセージ履歴に追記する。
+5. 処理は再び`supervisor`ノードに戻る(`Researcher -> supervisor`のEdge)。Supervisorは
+   今度は会話履歴に十分な情報があると判断し、`next="Writer"`を返す。
+6. `Writer`ノードが会話履歴(リサーチ結果)をもとにレポート本文を生成し、
+   `[Writer] ...`として追記する。
+7. 再度`supervisor`に戻り、レポートが揃ったと判断すれば`next="FINISH"`を返す。
+8. 条件付きEdgeが`FINISH`を`END`にマッピングしているため、グラフの実行はここで終了し、
+   最後に追記されたWriterのレポートが最終出力として返る。
+
+つまりStep2は「Supervisorが状況を見て次の担当を選び、担当が作業して結果を履歴に積み、
+またSupervisorに戻って次を判断する」というループを、Supervisorが`FINISH`と判断するまで
+繰り返す構造です。ステップ数の上限は`graph.invoke(..., {"recursion_limit": 25})`のように
+`recursion_limit`で制御しており、万一Supervisorが`FINISH`を出さない場合の暴走を防いでいます。
+
+### SUPERVISOR_PROMPTが定義しているもの
+
+`supervisor_node`の中で使われている`SUPERVISOR_PROMPT`は、Supervisorノードの中でLLMに
+下させる**判断基準**を定義しています。
+
+```python
+SUPERVISOR_PROMPT = f"""あなたはリサーチ&レポート作成チームの管理者です。
+以下のメンバーと会話しながら、次にどのメンバーを動かすか判断してください。
+メンバー: {MEMBERS}
+
+判断基準:
+- まだ十分な情報が集まっていない場合は Researcher
+- 情報は揃っていてレポートがまだ無い/不十分な場合は Writer
+- レポートが完成し、これ以上作業が不要な場合は FINISH
+"""
+
+def supervisor_node(state: State) -> State:
+    messages = [("system", SUPERVISOR_PROMPT)] + state["messages"]
+    decision = llm.with_structured_output(RouteDecision).invoke(messages)
+    return {"next": decision.next}
+```
+
+`supervisor_node`が実行されるたびに、`SUPERVISOR_PROMPT`が**systemメッセージ**として
+その時点の会話履歴の先頭に付け加えられ、LLMに渡されます。LLMはこの判断基準に従って
+`Researcher`/`Writer`/`FINISH`のいずれかを選び、`with_structured_output(RouteDecision)`に
+よってその選択が`next`フィールドに構造化された形で返されます。
+
+ここで役割分担を切り分けて理解しておくと後のStepでも応用しやすくなります。
+
+- **判断の中身(何を選ぶか)**: `SUPERVISOR_PROMPT`とLLM自身が担当。プロンプトの
+  「判断基準」の書き方次第で、Supervisorの振る舞い(何を優先するか)は変えられる。
+- **判断結果の実行(どこへ遷移するか)**: LLMではなく、LangGraph側の`add_conditional_edges`
+  が担当。
+
+```python
+graph_builder.add_conditional_edges(
+    "supervisor",
+    lambda state: state["next"],
+    {"Researcher": "Researcher", "Writer": "Writer", "FINISH": END},
+)
+```
+
+これはStep1で見た「LLMがtool_callsを出すかどうかを判断し、`tools_condition`がそれを
+機械的に読み取ってルーティングする」という構造と全く同じパターンです。**「何を選ぶか」を
+決めるのはプロンプト+LLM、「選ばれた結果をどう扱うか」を決めるのはグラフのEdge定義**、
+という役割分担はLangGraphのほぼ全ての条件分岐に共通する考え方だと理解しておくと、
+Step4のCriticやStep5のhuman_approvalを読むときも迷わなくなります。
+
 ### このStepで参照すべきドキュメント
 
 - [Multi-agent: サブエージェント構成の作り方](https://docs.langchain.com/oss/python/langchain/multi-agent/subagents-personal-assistant)
@@ -206,6 +276,26 @@ sequenceDiagram
     Graph-->>User: 文脈を踏まえた要約を返す
 ```
 
+### MemorySaverが状態を保持できる範囲
+
+```python
+memory = MemorySaver()
+graph = graph_builder.compile(checkpointer=memory)
+```
+
+状態が保持される範囲は「プログラムの実行中」というより、**`memory`オブジェクトが
+Pythonプロセスのメモリ(RAM)上に存在している間**、というのがより正確な理解です。
+
+- 同じPythonプロセス内であれば、`graph.invoke()`を複数回呼んでも(同じ`thread_id`を
+  使う限り)状態は保持され続ける。ターン1→ターン2の会話継続はこの仕組みで動いている。
+- スクリプトが終了してPythonプロセスが終わると、`memory`オブジェクトごと状態は消える。
+  次に同じスクリプトを実行しても、以前の会話の続きにはならない。
+- ディスクやDBには一切書き込まれないため、再起動やクラッシュに対する耐性も無い。
+
+`MemorySaver`はあくまで学習・開発用の実装です。プロセスをまたいで(例えばWebアプリの
+サーバー再起動後も)状態を残したい場合は、`SqliteSaver`(ファイルベース)や
+`PostgresSaver`(DB)といった永続化対応のCheckpointerに差し替える必要があります。
+
 ### このStepで参照すべきドキュメント
 
 - [Persistence(Checkpointer全般の解説)](https://docs.langchain.com/oss/python/langgraph/persistence)
@@ -245,6 +335,152 @@ flowchart TD
     Critic -->|approved=true または 上限到達| Supervisor{{Supervisor}}
 ```
 
+### 実装時に遭遇した落とし穴と修正(実例)
+
+ここからは、実際にこのハンズオンを進める中で遭遇した3つの不具合とその修正内容です。
+「LLMにルーティングを任せる」設計につきものの罠なので、自分で似た構成を作る際にも
+同じ問題に当たる可能性があります。
+
+**落とし穴1: 最終出力がレポート本文ではなく短いコメントになる**
+
+`result["messages"][-1].content`で最終出力を表示していたところ、実際には
+`[Critic] 承認しました。`のような短いコメントが表示され、Writerが書いたレポート本文が
+出てこない、という問題がありました。
+
+原因は、Critic承認後の遷移が`Writer -> Critic -> supervisor -> END`という順序で、
+`supervisor_node`は`{"next": decision.next}`しか返さず`messages`に何も追記しないため、
+会話履歴の最後に残るのは(Writer本文ではなく)直前に追記されたCriticの短いコメントに
+なってしまう、という構造上の理由でした。
+
+対策として、State専用フィールド`final_report`を追加し、`writer_node`が実行されるたびに
+最新のレポート本文をそこへ保存するようにしました。
+
+```python
+class State(TypedDict):
+    messages: Annotated[list, add_messages]
+    next: str
+    revision_count: int
+    final_report: str  # Writerが書いた最新のレポート本文(表示用)
+
+def writer_node(state: State) -> State:
+    ...
+    return {
+        "messages": [("ai", f"[Writer]\n{response.content}")],
+        "final_report": response.content,
+    }
+```
+
+最終出力は`result["messages"][-1].content`ではなく`result.get("final_report", ...)`を
+使うように変更しています。**「会話履歴の最後のメッセージ」と「欲しい成果物」は必ずしも
+一致しない**という点は、Supervisorパターンのように複数ノードがmessagesに書き込む構成では
+特に注意が必要です。
+
+**落とし穴2: Supervisorが、Critic承認前に勝手に`FINISH`を選んでしまう**
+
+落とし穴1を直した直後、`result["final_report"]`が存在せず`KeyError`になるケースに遭遇しました。
+ログを仕込んで調べたところ、Supervisorが**Writerを一度も実行しないまま**`next="FINISH"`を
+選んでしまい、グラフがそのままENDに到達していたことが分かりました。
+
+`SUPERVISOR_PROMPT`には「Critic承認済みのレポートがあるならFINISH」と書いていますが、
+これはあくまでLLMへの**お願い**であり、LangGraph側がその条件を強制しているわけではありません。
+LLMがプロンプトの意図を誤解釈すれば、簡単に条件を無視した判断をしてしまいます。
+
+これはStep1・Step2で見た「LLMの判断とLangGraphの機械的なルーティングは別物」という話の
+延長線上にある問題です。対策として、Criticが実際に承認した時だけTrueになる
+`report_approved`フラグをStateに追加し、Supervisorの`FINISH`という判断を**鵜呑みにせず**
+機械的にチェックするガード関数を導入しました。
+
+```python
+def route_from_supervisor(state: State) -> str:
+    decision = state["next"]
+    if decision == "FINISH" and not state.get("report_approved", False):
+        # Critic承認前にFINISHへ進もうとした場合は差し戻す
+        ...
+    return decision
+
+graph_builder.add_conditional_edges(
+    "supervisor",
+    route_from_supervisor,  # lambda state: state["next"] から変更
+    {"Researcher": "Researcher", "Writer": "Writer", "FINISH": END},
+)
+```
+
+**落とし穴3: ガードの差し戻し先を誤り、Researcherが無限に呼ばれ続ける**
+
+落とし穴2の対策を入れた直後、今度は処理がいつまで経っても終わらない状態に遭遇しました。
+各ノードの入り口でprintするデバッグログを仕込んで調べたところ、以下のループが起きていました。
+
+```
+[Researcher] 完了 → [supervisor] next=FINISH(誤判断)
+→ ガードが "final_reportが無い" という理由でResearcherへ差し戻す
+→ [Researcher] 完了 → [supervisor] next=FINISH(また誤判断)
+→ ガードがまたResearcherへ差し戻す ...(以降ループ)
+```
+
+最初のガード実装は「`final_report`が無ければResearcherへ、あればWriterへ」という
+基準でしたが、これは誤りでした。Researcherは既に実行済みで情報は集まっているのに、
+足りないのはWriterの実行だからです。`final_report`の有無ではなく
+「まだ何も進んでいない(最初のユーザーメッセージしか無い)かどうか」を基準に変更し、
+それ以外は常にWriterへ差し戻すよう修正しました。
+
+```python
+def route_from_supervisor(state: State) -> str:
+    decision = state["next"]
+    if decision == "FINISH" and not state.get("report_approved", False):
+        if len(state.get("messages", [])) <= 1:
+            return "Researcher"  # 本当に何も進んでいない場合のみ
+        return "Writer"          # それ以外は基本的にWriterへ
+    return decision
+```
+
+**落とし穴4: 差し戻し後、Writerが「差分」だけを返してレポートがほぼ空になる**
+
+落とし穴3までを直し、Step5(human-in-the-loop)まで動かしたところ、人間の承認確認画面に
+表示されたレポートがわずか25文字(`---`と`**レポート作成日**: 2025年`という
+フッターだけ)という状態に遭遇しました。表示の実装(`final_report`を使っているか等)を
+確認しても問題は無く、`len(report_text)`を表示するようにして初めて「本当に中身が
+ほとんど無い」ことが分かりました。
+
+原因はコードではなく、Writerへの**プロンプトの曖昧さ**でした。当時のプロンプトは
+「フィードバックを踏まえて修正してください」としか指示しておらず、これだとLLMは
+「変更点(差分)だけを返せばよい」と解釈することがあります。今回はまさにそれが起きて、
+Writerが「レポート作成日のフッターだけ」を差分のつもりで返し、それが`final_report`
+そのものとして保存されてしまっていました。
+
+```python
+def writer_node(state: State) -> State:
+    prompt = [
+        ("system", "あなたはレポート執筆の専門エージェントです。会話履歴のリサーチ結果や、"
+                   "Critic・人間からの差し戻しフィードバックがあればそれを踏まえて修正してください。\n"
+                   "重要: 差し戻しへの対応であっても、変更点や差分だけを返すのではなく、"
+                   "タイトル・本文・フッターを含むレポート全文を毎回最初から最後まで"
+                   "省略せずに出力してください。"),
+        *state["messages"],
+    ]
+    ...
+```
+
+「差分ではなく毎回全文を出力すること」を明示的に指示することで解消しました。あわせて、
+`main`側のレポート表示にも`len(report_text)`(文字数)と`----- REPORT START/END -----`
+という区切りを入れ、「本当に中身が短いのか」「ターミナルがスクロールしているだけなのか」を
+一目で切り分けられるようにしています。
+
+**このエピソードから学べること**
+
+- LLMベースのルーティング(Supervisorパターン)は、プロンプトの指示通りに動くとは限らない。
+  重要な制御フロー(いつ処理を終了してよいか等)は、State上のフラグなど**機械的に検証可能な
+  条件**でガードしておくと安全。
+- 「動かない」「終わらない」ときは、まず**各ノードの入り口/出口にログを仕込んで、
+  実際にどこで何が起きているかを可視化する**のが最短の近道。今回もログを見て初めて
+  「Researcherが無限に呼ばれ続けている」という事実に気づけた。
+- 一度直したつもりの安全装置(ガード)自体にもバグが混入し得る。安全装置を入れたら
+  それで終わりではなく、実際にログで動作を確認することが重要。
+- 「修正してください」「フィードバックを踏まえて」のような指示は、LLMに**差分だけを
+  返す余地**を与えてしまうことがある。ドキュメント生成のように「毎回完全な成果物が
+  欲しい」タスクでは、その旨を明示的にプロンプトへ書く必要がある。
+- 出力が短すぎる/空に見えるときは、まず**文字数を表示する**などして「本当に中身が
+  無いのか」「表示・ターミナル側の問題なのか」を切り分けるとデバッグが早い。
+
 ### このStepで参照すべきドキュメント
 
 - [Graph API overview: 条件付きEdgeとループ](https://docs.langchain.com/oss/python/langgraph/graph-api)
@@ -262,12 +498,21 @@ flowchart TD
   → 実際に手を動かす課題: [`exercises/step4_ex1_persistent_revision_count.py`](./exercises/step4_ex1_persistent_revision_count.py)
 - Criticのfeedbackを`SystemMessage`ではなく専用のStateフィールドに分離し、
   Writerへの伝え方を変えてみる。
+- SUPERVISOR_PROMPTの判断基準の書き方を変えて、そもそもCritic承認前に`FINISH`を
+  選んでしまう頻度が減らせるか試してみる(ガードは残しつつ、プロンプト側の改善も
+  効果があるか検証してみる)。
 
 ---
 
 ## Step5(最終): human-in-the-loop 承認フロー
 
 **ファイル**: `step5_human_in_the_loop.py`
+
+> Step4の「実装時に遭遇した落とし穴と修正(実例)」で説明した`final_report`
+> フィールド・`report_approved`フラグ・`route_from_supervisor`ガードは、
+> Step5にもそのまま引き継がれています(Critic承認に加えて人間承認が必要になった分、
+> `report_approved`をTrueにするのは`human_approval_node`の役目になっています)。
+> 詳細な経緯はStep4のセクションを参照してください。
 
 ### 何をしているか
 
