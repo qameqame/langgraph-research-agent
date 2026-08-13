@@ -27,10 +27,11 @@ Step3のグラフに「品質チェック」を担当するCriticエージェン
 
 import os
 import sys
+from datetime import date
 from dotenv import load_dotenv
 from typing import Annotated, Literal, TypedDict
 
-from langchain_anthropic import ChatAnthropic
+from langchain_ollama import ChatOllama
 from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import MemorySaver
@@ -51,7 +52,17 @@ if not os.environ.get("TAVILY_API_KEY"):
 MEMBERS = ["Researcher", "Writer"]
 MAX_REVISIONS = 2  # Critic差し戻しの上限回数
 
-llm = ChatAnthropic(model="claude-sonnet-4-5-20250929", temperature=0, timeout=60)
+llm = ChatOllama(model="qwen3:30b", temperature=0, client_kwargs={"timeout": 60})
+
+# ローカルLLM(Ollama)は今の日付を知らないため、明示的に伝えておく
+# (伝えないと「学習データの頃が現在」だと誤解し、検索すべき場面で検索しない等の
+# 誤判断をすることがある)。
+TODAY_NOTE = (
+    f"今日の日付は{date.today().isoformat()}です。"
+    "あなたの学習データの知識は古い可能性があるため、"
+    "最新情報や特定の年に関する質問には自分の知識だけで判断せず、"
+    "必要に応じて検索ツールを使って確認してください。"
+)
 
 
 class State(TypedDict):
@@ -102,7 +113,8 @@ def supervisor_node(state: State) -> State:
 search_tool = TavilySearchResults(max_results=3)
 researcher_agent = create_react_agent(
     llm, tools=[search_tool],
-    prompt="あなたはリサーチ専門エージェントです。検索ツールで事実情報を集め、箇条書きで報告してください。",
+    prompt=TODAY_NOTE + "\n\n"
+           "あなたはリサーチ専門エージェントです。検索ツールで事実情報を集め、箇条書きで報告してください。",
 )
 
 
@@ -121,7 +133,8 @@ WRITER_MAX_ATTEMPTS = 3
 def writer_node(state: State) -> State:
     print("[Writer] 執筆中...", flush=True)
     base_prompt = [
-        ("system", "あなたはレポート執筆の専門エージェントです。会話履歴のリサーチ結果や、"
+        ("system", TODAY_NOTE + "\n\n"
+                   "あなたはレポート執筆の専門エージェントです。会話履歴のリサーチ結果や、"
                    "Criticからの差し戻しフィードバックがあればそれを踏まえてレポートを作成・修正してください。\n"
                    "重要: 差し戻しへの対応であっても、変更点や差分だけを返すのではなく、"
                    "タイトル・本文・フッターを含むレポート全文を毎回最初から最後まで"

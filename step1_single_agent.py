@@ -15,16 +15,29 @@ LangGraphの最も基本的な構成を学ぶ。
 """
 
 import os
+from datetime import date
 from dotenv import load_dotenv
 from typing import Annotated, TypedDict
 
-from langchain_anthropic import ChatAnthropic
+from langchain_ollama import ChatOllama
 from langchain_community.tools.tavily_search import TavilySearchResults
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 
 load_dotenv()
+
+# ローカルLLM(Ollama)は学習時点の知識しか持たず、今の日付を知らない。
+# 何も伝えないと「今は学習データの頃の年」だと思い込み、それを理由に
+# 検索すべき場面でも検索しない、といった誤判断をすることがある。
+# システムメッセージで明示的に今日の日付を伝え、日付が絡む質問では
+# 自己判断せず検索するよう指示しておく。
+SYSTEM_PROMPT = (
+    f"今日の日付は{date.today().isoformat()}です。"
+    "あなたの学習データの知識は古い可能性があるため、"
+    "最新情報や特定の年に関する質問には、自分の知識だけで判断せず、"
+    "必要に応じて検索ツールを使って確認してください。"
+)
 
 
 # --- 1. State定義 ---
@@ -37,14 +50,15 @@ class State(TypedDict):
 search_tool = TavilySearchResults(max_results=3)
 tools = [search_tool]
 
-llm = ChatAnthropic(model="claude-sonnet-4-5-20250929", temperature=0)
+llm = ChatOllama(model="qwen3:30b", temperature=0)
 llm_with_tools = llm.bind_tools(tools)
 
 
 # --- 3. ノード定義 ---
 def agent_node(state: State) -> State:
     """LLMを呼び出し、必要ならツール呼び出しを含む応答を生成する"""
-    response = llm_with_tools.invoke(state["messages"])
+    messages = [("system", SYSTEM_PROMPT), *state["messages"]]
+    response = llm_with_tools.invoke(messages)
     return {"messages": [response]}
 
 

@@ -76,7 +76,7 @@ flowchart TD
 判断が実際に発生する場所はコード上2箇所に分かれています。
 
 ```python
-llm = ChatAnthropic(model="claude-sonnet-4-5-20250929", temperature=0)
+llm = ChatOllama(model="qwen3:30b", temperature=0)
 llm_with_tools = llm.bind_tools(tools)          # ① ツールの存在をLLMに知らせる(設定のみ)
 
 def agent_node(state: State) -> State:
@@ -85,12 +85,14 @@ def agent_node(state: State) -> State:
 ```
 
 - **① `bind_tools(tools)`**: 「このLLMはこのツール一式を使ってよい」と権限を与える設定。
-  Anthropic APIへのリクエストに`tools`パラメータ(各ツールの名前・説明・引数スキーマ)が
+  LLMへのリクエストに`tools`パラメータ(各ツールの名前・説明・引数スキーマ)が
   付与されるようになるだけで、この時点ではまだ判断は発生していない。
-- **② `llm_with_tools.invoke(...)`**: `agent`ノードが実行されるたびに呼ばれる、実際のAPI呼び出し。
-  ツール定義付きのリクエストを受け取ったClaudeが、会話履歴を見て「ツールを呼ぶべきか、
-  このままテキストで答えるべきか」を毎回自動的に判断する。これはAnthropicのtool use機能自体の
-  挙動であり、コード側に「判断してください」という明示的なプロンプト文は存在しない。
+- **② `llm_with_tools.invoke(...)`**: `agent`ノードが実行されるたびに呼ばれる、実際のLLM呼び出し。
+  ツール定義付きのリクエストを受け取ったモデルが、会話履歴を見て「ツールを呼ぶべきか、
+  このままテキストで答えるべきか」を毎回自動的に判断する。これはtool use機能自体の
+  挙動であり、コード側に「判断してください」という明示的なプロンプト文は存在しない
+  (ただしローカルモデルはこの判断を誤りやすい。詳細は本ドキュメント末尾の
+  「ローカルLLM(Ollama)移行と落とし穴」を参照)。
 
 判断結果は`response.tool_calls`というフィールドに格納されて返ってくる。
 `tools_condition`はこの`tool_calls`が空かどうかを見ているだけの**機械的な分岐**であり、
@@ -564,6 +566,82 @@ sequenceDiagram
   (1ノード1interruptのルールを守りつつ二段階確認を実装する)
 - ターミナル入力の代わりに、Slack通知やWebフォームからの入力で再開する構成に
   置き換えるとしたら、どこを変更すればよいか設計してみる(コードは書かなくてもOK)。
+
+---
+
+## ローカルLLM(Ollama)移行と落とし穴
+
+このプロジェクトはもともとAnthropic API(`ChatAnthropic`)を使う想定で作られていましたが、
+API利用上限に達したことをきっかけに、途中から**Macにネイティブインストールした
+Ollama(モデル: `qwen3:30b`)** で動かす構成に切り替えました(Dockerは使っていません)。
+全ファイルで`ChatAnthropic` → `ChatOllama`(`langchain-ollama`パッケージ)に置き換わっています。
+
+### クラウドAPIとローカルLLMの違いで気をつけたこと
+
+- **`tool_choice`が効かない**: `ChatAnthropic`では`tool_choice="any"`や
+  `{"type": "none"}`でツール使用を強制/禁止できますが、`ChatOllama`は現時点でこの
+  パラメータをサポートしておらず、渡しても無視されます。tool_choiceの挙動を確認する
+  課題([`exercises/step1_ex2_tool_choice.py`](./exercises/step1_ex2_tool_choice.py))は
+  ローカルモデルでは意図通りに動かないため、この課題だけAnthropicに戻すことを推奨しています。
+- **タイムアウトの指定方法が違う**: `ChatAnthropic(timeout=60)`のような直接指定ではなく、
+  `ChatOllama(client_kwargs={"timeout": 60})`という形でクライアント経由で渡す必要があります。
+- **モデル名の指定は完全一致が必要**: `ollama pull`で取得したタグ名(例: `qwen3:30b`)と
+  コード内の`model=`指定が1文字でも違うと`ResponseError: model not found`になります。
+  `ollama list`で実際に取得済みのタグ名を確認してから指定してください。
+
+### 落とし穴: ローカルLLMは「今日の日付」を知らない
+
+Step1を実際にOllamaへ切り替えて動かしたところ、2026年の話をしているのに
+モデルが「今は2023年です」という前提で回答し、本来なら検索すべき最新情報の質問でも
+検索ツールを使わずに(古い知識のまま)回答してしまう、という現象に遭遇しました。
+
+原因は単純で、**ローカルLLMは学習データが作られた時点までの知識しか持っておらず、
+「現在の日付」をシステム側から明示的に教えない限り知る術がない**ためです。クラウドの
+Claudeでもこの問題自体は起こり得ますが、学習データが比較的新しく、また「自分の知識は
+古いかもしれない」という前提で振る舞う傾向が強いため、目立ちにくいだけです。
+
+対策として、`date.today().isoformat()`で取得した実際の日付をシステムプロンプトに
+明示的に埋め込み、「日付が絡む質問は自分の知識を過信せず検索する」よう指示する
+`SYSTEM_PROMPT`(Step1の単一エージェント版)/`TODAY_NOTE`(Step2以降のマルチエージェント版)
+という定数を各ファイルに追加しました。
+
+```python
+from datetime import date
+
+TODAY_NOTE = (
+    f"今日の日付は{date.today().isoformat()}です。"
+    "あなたの学習データの知識は古い可能性があるため、"
+    "最新情報や特定の年に関する質問には自分の知識だけで判断せず、"
+    "必要に応じて検索ツールを使って確認してください。"
+)
+```
+
+これを`create_react_agent`の`prompt=`引数(Researcher)や、各ノードが組み立てる
+systemメッセージ(Writerなど)の先頭に連結することで、モデルが呼ばれるたびに
+「今日は本当は何年か」を思い出させています。
+
+```python
+researcher_agent = create_react_agent(
+    llm, tools=[search_tool],
+    prompt=TODAY_NOTE + "\n\n" + "あなたはリサーチ専門エージェントです。...",
+)
+```
+
+**このエピソードから学べること**
+
+- ローカルLLMを使う場合、クラウドAPIでは意識しなくてよかった「モデルは現在時刻を
+  知らない」という前提を、システムプロンプト側で毎回補ってあげる必要がある。
+- 「モデルが誤った前提で動いている」という不具合は、出力される回答の内容(この場合は
+  西暦の記述)をよく読むことで発見できる。回答が変・古いと感じたら、まずモデルが
+  暗黙に置いている前提を疑うとよい。
+- この種の問題は、Step4で扱った「LLMの判断は"お願い"でしかなく強制力がない」という
+  教訓の一種でもある。プロンプトで事実(今日の日付)を明示的に与えることで、
+  モデルの誤判断の材料そのものを減らすアプローチと言える。
+
+### このセクションで参照すべきドキュメント
+
+- [ChatOllama(langchain-ollama)](https://docs.langchain.com/oss/python/integrations/chat/ollama)
+- [Ollama公式サイト(モデル一覧・pullコマンド)](https://ollama.com/library)
 
 ---
 

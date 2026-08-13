@@ -3,10 +3,11 @@
 ======================================
 """
 
+from datetime import date
 from dotenv import load_dotenv
 from typing import Annotated, Literal, TypedDict
 
-from langchain_anthropic import ChatAnthropic
+from langchain_ollama import ChatOllama
 from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_core.messages import HumanMessage
 from langgraph.graph import StateGraph, START, END
@@ -18,7 +19,17 @@ load_dotenv()
 
 MEMBERS = ["Researcher", "Writer", "FactChecker"]
 
-llm = ChatAnthropic(model="claude-sonnet-4-5-20250929", temperature=0)
+llm = ChatOllama(model="qwen3:30b", temperature=0)
+
+# ローカルLLM(Ollama)は今の日付を知らないため、明示的に伝えておく
+# (伝えないと「学習データの頃が現在」だと誤解し、検索すべき場面で検索しない等の
+# 誤判断をすることがある)。
+TODAY_NOTE = (
+    f"今日の日付は{date.today().isoformat()}です。"
+    "あなたの学習データの知識は古い可能性があるため、"
+    "最新情報や特定の年に関する質問には自分の知識だけで判断せず、"
+    "必要に応じて検索ツールを使って確認してください。"
+)
 
 
 class State(TypedDict):
@@ -51,7 +62,8 @@ search_tool = TavilySearchResults(max_results=3)
 
 researcher_agent = create_react_agent(
     llm, tools=[search_tool],
-    prompt="あなたはリサーチ専門エージェントです。検索ツールで事実情報を集め、箇条書きで報告してください。",
+    prompt=TODAY_NOTE + "\n\n"
+           "あなたはリサーチ専門エージェントです。検索ツールで事実情報を集め、箇条書きで報告してください。",
 )
 
 
@@ -62,7 +74,8 @@ def researcher_node(state: State) -> State:
 
 def writer_node(state: State) -> State:
     prompt = [
-        ("system", "あなたはレポート執筆の専門エージェントです。会話履歴のリサーチ結果を元に、"
+        ("system", TODAY_NOTE + "\n\n"
+                   "あなたはレポート執筆の専門エージェントです。会話履歴のリサーチ結果を元に、"
                    "簡潔で読みやすい日本語レポートを作成してください。"),
         *state["messages"],
     ]
@@ -73,6 +86,7 @@ def writer_node(state: State) -> State:
 fact_checker_agent = create_react_agent(
     llm, tools=[search_tool],
     prompt=(
+        TODAY_NOTE + "\n\n"
         "あなたはファクトチェック専門エージェントです。直前のWriterのレポートに含まれる"
         "数値・統計・固有名詞などを検索して裏取りしてください。"
         "問題があれば具体的に指摘し、問題が無ければ『検証OK: 主要な主張は裏付けが取れました』"

@@ -16,10 +16,11 @@ Step 2: Supervisorパターンでマルチエージェント化
 """
 
 import os
+from datetime import date
 from dotenv import load_dotenv
 from typing import Annotated, Literal, TypedDict
 
-from langchain_anthropic import ChatAnthropic
+from langchain_ollama import ChatOllama
 from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_core.messages import HumanMessage
 from langgraph.graph import StateGraph, START, END
@@ -32,7 +33,18 @@ load_dotenv()
 MEMBERS = ["Researcher", "Writer"]
 OPTIONS = MEMBERS + ["FINISH"]
 
-llm = ChatAnthropic(model="claude-sonnet-4-5-20250929", temperature=0)
+llm = ChatOllama(model="qwen3:30b", temperature=0)
+
+# ローカルLLM(Ollama)は学習時点の知識しか持たず、今の日付を知らない。
+# 何も伝えないと「今は学習データの頃の年」だと思い込み、それを理由に
+# 検索すべき場面でも検索しない、といった誤判断をすることがある。
+# Researcher/Writerのプロンプトに明示的に今日の日付を伝えておく。
+TODAY_NOTE = (
+    f"今日の日付は{date.today().isoformat()}です。"
+    "あなたの学習データの知識は古い可能性があるため、"
+    "最新情報や特定の年に関する質問には自分の知識だけで判断せず、"
+    "必要に応じて検索ツールを使って確認してください。"
+)
 
 
 # --- State定義 ---
@@ -67,7 +79,8 @@ def supervisor_node(state: State) -> State:
 search_tool = TavilySearchResults(max_results=3)
 researcher_agent = create_react_agent(
     llm, tools=[search_tool],
-    prompt="あなたはリサーチ専門エージェントです。検索ツールを使って事実情報を集めてください。推測や執筆は行わず、集めた事実を箇条書きで報告してください。",
+    prompt=TODAY_NOTE + "\n\n"
+           "あなたはリサーチ専門エージェントです。検索ツールを使って事実情報を集めてください。推測や執筆は行わず、集めた事実を箇条書きで報告してください。",
 )
 
 
@@ -80,7 +93,8 @@ def researcher_node(state: State) -> State:
 # --- Writerエージェント(ツールなし、執筆に専念) ---
 def writer_node(state: State) -> State:
     prompt = [
-        ("system", "あなたはレポート執筆の専門エージェントです。これまでの会話にあるリサーチ結果を元に、"
+        ("system", TODAY_NOTE + "\n\n"
+                   "あなたはレポート執筆の専門エージェントです。これまでの会話にあるリサーチ結果を元に、"
                    "簡潔で読みやすい日本語レポート(見出し・要点付き)を作成してください。"),
         *state["messages"],
     ]

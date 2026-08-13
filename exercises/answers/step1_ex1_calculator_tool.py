@@ -4,10 +4,11 @@
 """
 
 import os
+from datetime import date
 from dotenv import load_dotenv
 from typing import Annotated, TypedDict
 
-from langchain_anthropic import ChatAnthropic
+from langchain_ollama import ChatOllama
 from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_core.tools import tool
 from langgraph.graph import StateGraph, START, END
@@ -15,6 +16,16 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 
 load_dotenv()
+
+# ローカルLLM(Ollama)は今の日付を知らないため、明示的に伝えておく
+# (伝えないと「学習データの頃が現在」だと誤解し、検索すべき場面で検索しない等の
+# 誤判断をすることがある)。
+SYSTEM_PROMPT = (
+    f"今日の日付は{date.today().isoformat()}です。"
+    "あなたの学習データの知識は古い可能性があるため、"
+    "最新情報や特定の年に関する質問には自分の知識だけで判断せず、"
+    "必要に応じて検索ツールを使って確認してください。"
+)
 
 
 class State(TypedDict):
@@ -40,12 +51,13 @@ def calculator(expression: str) -> str:
 search_tool = TavilySearchResults(max_results=3)
 tools = [search_tool, calculator]
 
-llm = ChatAnthropic(model="claude-sonnet-4-5-20250929", temperature=0)
+llm = ChatOllama(model="qwen3:30b", temperature=0)
 llm_with_tools = llm.bind_tools(tools)
 
 
 def agent_node(state: State) -> State:
-    response = llm_with_tools.invoke(state["messages"])
+    messages = [("system", SYSTEM_PROMPT), *state["messages"]]
+    response = llm_with_tools.invoke(messages)
     return {"messages": [response]}
 
 

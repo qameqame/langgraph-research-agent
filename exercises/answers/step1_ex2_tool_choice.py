@@ -1,12 +1,16 @@
 """
 解答: 課題1-2 tool_choiceの実験
 ======================================
+
+注意(Ollama利用時): ChatOllamaのtool_choiceは現状Ollama側で未サポートのため
+無視され、B/Cで意図した強制/禁止の挙動が再現できないことがあります。
+tool_choiceの制御を確認したい場合はAnthropicのAPIキーに戻して試してください。
 """
 
 import os
 from dotenv import load_dotenv
 
-from langchain_anthropic import ChatAnthropic
+from langchain_ollama import ChatOllama
 from langchain_community.tools.tavily_search import TavilySearchResults
 
 load_dotenv()
@@ -14,7 +18,7 @@ load_dotenv()
 search_tool = TavilySearchResults(max_results=3)
 tools = [search_tool]
 
-llm = ChatAnthropic(model="claude-sonnet-4-5-20250929", temperature=0)
+llm = ChatOllama(model="qwen3:30b", temperature=0)
 
 question = "1 + 1 は何ですか?"
 
@@ -25,13 +29,22 @@ llm_auto = llm.bind_tools(tools)
 llm_forced = llm.bind_tools(tools, tool_choice="any")
 
 # C) 禁止: ツールを一切使わせない
-llm_none = llm.bind_tools(tools, tool_choice="none")
+# 注意: tool_choice="none"という文字列は「'none'という名前のツールを使え」と
+# 解釈され、存在しないツールとしてAPIエラーになる(実際にハマったポイント)。
+# ツール使用を無効化する場合は辞書形式で{"type": "none"}を渡す。
+llm_none = llm.bind_tools(tools, tool_choice={"type": "none"})
 
 
 def describe(label, response):
     tool_calls = getattr(response, "tool_calls", [])
     print(f"[{label}] tool_calls={[tc['name'] for tc in tool_calls] or 'なし'}")
-    print(f"[{label}] content={response.content}")
+    # ツールを呼んだ場合、Anthropicのcontentはテキストではなく
+    # tool_useブロックを含むリストになり、そのまま表示すると読みにくい。
+    # tool_callsが無い(=テキスト回答のみ)場合だけcontentを表示する。
+    if tool_calls:
+        print(f"[{label}] content=(ツール呼び出しのみでテキスト応答なし)")
+    else:
+        print(f"[{label}] content={response.content}")
 
 
 if __name__ == "__main__":
@@ -52,6 +65,16 @@ if __name__ == "__main__":
 # ような特殊なワークフロー(例: 必ず検索結果に基づいて回答させたいRAG的な用途)
 # に限定して使うのが安全。
 #
-# 参考: ChatAnthropicのtool_choiceは "auto" | "any" | "none" | 特定のツール名(str)
-# を受け付ける。正確な受理値は必ずリファレンスで最新版を確認すること:
+# 補足: response.contentの形について。ツールを呼ばない場合(A, C)はcontentが
+# 単純な文字列になるが、ツールを呼ぶ場合(B)はcontentがテキストブロック/
+# tool_useブロックなどを含む「リスト」になる(今回はテキスト部分が空で
+# tool_useブロックのみだったため、生のdict列がそのまま見える)。
+# ツール呼び出しの有無を確認したいときはcontentではなくtool_callsを見ること。
+#
+# 参考: ChatAnthropic.bind_toolsのtool_choiceは、"auto" / "any" / 特定のツール名(str)
+# は文字列のショートカットとして受け付けるが、"none"だけは特別扱いされておらず
+# 「'none'という名前のツール」を指定したとみなされてしまう。ツール使用を無効化
+# したい場合は必ず辞書形式 {"type": "none"} を渡すこと。
+# こうした文字列ショートカットの対応範囲はバージョンによって変わりうるため、
+# 実装前に必ずリファレンスの最新版を確認すること:
 # https://reference.langchain.com/python/langchain-anthropic/chat_models/ChatAnthropic

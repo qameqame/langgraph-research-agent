@@ -45,14 +45,40 @@ flowchart TD
 
 ## セットアップ
 
+LLMはローカルのOllama(qwen3:30b)を使う構成になっています(Anthropic APIの
+利用上限を回避するため、クラウドAPIからローカル実行に切り替え済み)。
+
 ```bash
+# 1. Ollamaをインストール(Mac、Dockerなし)
+brew install ollama
+brew services start ollama   # または `ollama serve` で手動起動
+
+# 2. モデルを取得(18GB程度あるので少し時間がかかります)
+ollama pull qwen3:30b
+
+# 3. Python依存パッケージ
 pip install -r requirements.txt
 cp .env.example .env
-# .env を開いて ANTHROPIC_API_KEY と TAVILY_API_KEY を設定
+# .env を開いて TAVILY_API_KEY を設定(ANTHROPIC_API_KEYは不要になりました)
 ```
 
-- `ANTHROPIC_API_KEY`: https://console.anthropic.com/
 - `TAVILY_API_KEY`: https://tavily.com/ (検索用。無料枠あり)
+- `ANTHROPIC_API_KEY`: 現在は未使用。`exercises/step1_ex2_tool_choice.py`
+  (tool_choiceの強制/禁止を確認する課題)だけはOllamaがtool_choiceを
+  サポートしていないため、この課題に限りAnthropicへ戻すと挙動を確認しやすいです。
+  https://console.anthropic.com/
+
+### ローカルLLM利用時の注意: 日付を知らない問題
+
+Ollamaで動くローカルLLMは学習データの時点までの知識しか持たず、「今日が何日か」を
+知りません。何も伝えないと「今は学習データが作られた頃の年だ」と思い込み、
+本来は検索すべき最新情報の質問でも、自分の(古い)知識だけで誤って回答してしまう
+ことがあります。
+
+この対策として、各Stepのソースコードでは `date.today()` で取得した実際の日付を
+システムプロンプトに明示的に埋め込み、「日付が絡む質問は自分の知識を過信せず検索する」
+よう指示しています(`SYSTEM_PROMPT` / `TODAY_NOTE` という名前の定数)。
+詳細は [TUTORIAL.md](./TUTORIAL.md) の「ローカルLLM(Ollama)移行と落とし穴」を参照してください。
 
 ## 実行方法
 
