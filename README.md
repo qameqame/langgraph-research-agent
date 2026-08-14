@@ -45,16 +45,18 @@ flowchart TD
 
 ## セットアップ
 
-LLMはローカルのOllama(qwen3:30b)を使う構成になっています(Anthropic APIの
-利用上限を回避するため、クラウドAPIからローカル実行に切り替え済み)。
+LLMはローカルのOllama(qwen3:8b)を使う構成になっています(Anthropic APIの
+利用上限を回避するため、クラウドAPIからローカル実行に切り替え済み)。学習目的で
+体感速度を優先し、比較的軽量な8Bモデルを採用しています(大きめの`qwen3:30b`等に
+差し替えることも可能です。トレードオフは後述)。
 
 ```bash
 # 1. Ollamaをインストール(Mac、Dockerなし)
 brew install ollama
 brew services start ollama   # または `ollama serve` で手動起動
 
-# 2. モデルを取得(18GB程度あるので少し時間がかかります)
-ollama pull qwen3:30b
+# 2. モデルを取得(5GB程度)
+ollama pull qwen3:8b
 
 # 3. Python依存パッケージ
 pip install -r requirements.txt

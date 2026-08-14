@@ -76,7 +76,7 @@ flowchart TD
 判断が実際に発生する場所はコード上2箇所に分かれています。
 
 ```python
-llm = ChatOllama(model="qwen3:30b", temperature=0)
+llm = ChatOllama(model="qwen3:8b", temperature=0)
 llm_with_tools = llm.bind_tools(tools)          # ① ツールの存在をLLMに知らせる(設定のみ)
 
 def agent_node(state: State) -> State:
@@ -573,8 +573,13 @@ sequenceDiagram
 
 このプロジェクトはもともとAnthropic API(`ChatAnthropic`)を使う想定で作られていましたが、
 API利用上限に達したことをきっかけに、途中から**Macにネイティブインストールした
-Ollama(モデル: `qwen3:30b`)** で動かす構成に切り替えました(Dockerは使っていません)。
+Ollama** で動かす構成に切り替えました(Dockerは使っていません)。
 全ファイルで`ChatAnthropic` → `ChatOllama`(`langchain-ollama`パッケージ)に置き換わっています。
+モデルは最初`qwen3:30b`で試していましたが、後述するthinkingモードの重さもあって
+体感速度がかなり遅く、学習目的では軽快さを優先したいと考え、最終的に**`qwen3:8b`**
+に切り替えています(パラメータ数が少ない分、ルーティング判断やレポート品質は
+30bより不安定になり得るというトレードオフがあります。品質を優先したい場合は
+`qwen3:30b`など大きめのモデルに戻すことも可能です)。
 
 ### クラウドAPIとローカルLLMの違いで気をつけたこと
 
@@ -585,7 +590,7 @@ Ollama(モデル: `qwen3:30b`)** で動かす構成に切り替えました(Dock
   ローカルモデルでは意図通りに動かないため、この課題だけAnthropicに戻すことを推奨しています。
 - **タイムアウトの指定方法が違う**: `ChatAnthropic(timeout=60)`のような直接指定ではなく、
   `ChatOllama(client_kwargs={"timeout": 60})`という形でクライアント経由で渡す必要があります。
-- **モデル名の指定は完全一致が必要**: `ollama pull`で取得したタグ名(例: `qwen3:30b`)と
+- **モデル名の指定は完全一致が必要**: `ollama pull`で取得したタグ名(例: `qwen3:8b`)と
   コード内の`model=`指定が1文字でも違うと`ResponseError: model not found`になります。
   `ollama list`で実際に取得済みのタグ名を確認してから指定してください。
 
@@ -638,10 +643,173 @@ researcher_agent = create_react_agent(
   教訓の一種でもある。プロンプトで事実(今日の日付)を明示的に与えることで、
   モデルの誤判断の材料そのものを減らすアプローチと言える。
 
+### 落とし穴: qwen3のthinkingモードで体感速度が大幅に悪化する
+
+Step2の演習(3方向Supervisor)を実行したところ「なかなか終わらない」という状態に
+遭遇しました。`ollama ps`で確認すると、モデルは`100% GPU`できちんと処理は進んでおり
+フリーズはしていませんでしたが、`SIZE`欄が想定の18GB程度ではなく**32GB**まで
+膨らんでおり、`CONTEXT`欄も**262144(26万トークン)**という非常に大きな値になっていました。
+
+原因は、Qwen3系モデルが**デフォルトでthinking(内部の思考過程)を出力する設定**に
+なっていることでした。最終回答を返す前に長い思考トークン列を生成するため、1回のLLM
+呼び出しごとに数十秒〜数分の遅延が発生します。Supervisorパターンは
+「Supervisor判断 → Researcher(ReAct) → Supervisor判断 → Writer → Supervisor判断」
+のようにLLM呼び出しが何度も連鎖するため、この遅延が積み重なって全体の体感速度が
+大きく悪化していました。
+
+対策として、`ChatOllama`に`model_kwargs={"think": False}`を渡し、thinkingを無効化
+しました。
+
+```python
+llm = ChatOllama(model="qwen3:8b", temperature=0, model_kwargs={"think": False})
+```
+
+注意点として、LangChain側が用意している`reasoning=False`という引数(例:
+`ChatOllama(model="qwen3:8b", reasoning=False)`)は、Qwen3に対しては効かない
+既知の不具合があります。Ollama API本来のパラメータである`think`を`model_kwargs`
+経由で直接渡す方法であれば確実に反映されます。
+
+**このエピソードから学べること**
+
+- ローカルLLMが「動いているのに遅い」ときは、まず`ollama ps`で実際に処理中か
+  (`PROCESSOR`が`100% GPU`になっているか)を確認し、フリーズと単純な低速処理を
+  切り分けるとよい。
+- thinking対応モデル(Qwen3、DeepSeek-R1など)はデフォルトで思考トークンを
+  大量に生成する。Supervisorのルーティング判断のように「速く・短い答えだけで
+  よい」呼び出しでは、thinkingを無効化すると体感速度が大きく改善する。
+- ライブラリのラッパー引数(`reasoning=`)よりも、プロバイダAPI本来のパラメータ名
+  (`think`)を`model_kwargs`で直接渡す方が確実に効くことがある。挙動が期待通り
+  でない場合は、ラッパー層を疑ってAPI本来のパラメータ名も試してみるとよい。
+
+### 落とし穴: thinking無効化 + 構造化出力(JSON)の組み合わせで壊れる
+
+qwen3:8bに切り替えた直後、`exercises/step2_ex1_three_way_supervisor.py`の
+`supervisor_node`で`OutputParserException: Invalid json output`が発生しました。
+エラーメッセージの中身を見ると、LLMが`{"next": "..."}`のようなJSONではなく、
+それまでの会話履歴の内容(Researcher/Writerの発言)をそのまま垂れ流したような
+長い文章を返しており、しかも文中に`</think>`という閉じタグだけが唐突に
+混ざっていました。
+
+原因を調べたところ、これは**Ollama/Qwen3側の既知の不具合**でした。
+`with_structured_output`はOllamaの「JSON文法に沿った出力だけを許可する」機能
+(structured output)を使いますが、これと`think: false`(thinking無効化)を
+同時に指定すると、内部的にプロンプトへ`<think>\n\n</think>`という空のタグが
+埋め込まれる実装になっており、これがJSON文法制約と衝突して**壊れた/無効な
+出力を返す**ことがあるようです([ollama/ollama#10929](https://github.com/ollama/ollama/issues/10929)、
+[vllm-project/vllm#18819](https://github.com/vllm-project/vllm/issues/18819)などで
+同様の報告あり)。逆にthinkingを無効化しなければ(有効なままにしておけば)、
+構造化出力は正常なJSONを返す、という報告が複数のプロジェクトで確認できました。
+
+対策として、**thinkingを無効化した通常の`llm`とは別に、構造化出力専用の
+`router_llm`(thinkingは無効化しない)を用意**し、`with_structured_output`を
+使うSupervisorのルーティング判断・Criticの審査だけをそちらに向けました。
+
+```python
+llm = ChatOllama(model="qwen3:8b", temperature=0, model_kwargs={"think": False})
+
+# with_structured_output(JSON構造化出力)はthink無効化と相性が悪く、
+# 無効なJSONを返すことがある(Ollama/Qwen3の既知の問題)。
+# 構造化出力が必要な呼び出しには、thinkingを有効なままにした専用の
+# LLMインスタンスを使う。
+router_llm = ChatOllama(model="qwen3:8b", temperature=0)
+
+def supervisor_node(state: State) -> State:
+    messages = [("system", SUPERVISOR_PROMPT)] + state["messages"]
+    decision = router_llm.with_structured_output(RouteDecision).invoke(messages)
+    return {"next": decision.next}
+```
+
+自由記述のレポート生成(Researcher/Writer)は`llm`(thinking無効・高速)、
+`next`やapproved/feedbackのようなJSON構造化出力が必要な判断は`router_llm`
+(thinking有効・正確性優先)、と**呼び出しの性質によって使い分ける**のが
+ポイントです。
+
+**このエピソードから学べること**
+
+- 「thinkingを無効化する」「構造化出力(JSON)を強制する」は、それぞれ単体では
+  問題なくても、組み合わせると壊れることがある。個別には正しいはずの設定を
+  組み合わせたときにだけ再現する不具合は、まずライブラリ/プロバイダ側のIssue
+  トラッカーを検索してみると同じ報告が見つかることが多い。
+- エラーメッセージに含まれる生の出力(この場合はJSONとして解析できなかった
+  テキスト全体)をよく読むと、単なる形式エラーなのか、モデルが根本的に
+  タスクを誤解しているのかの手がかりになる。今回は`</think>`という痕跡が
+  「thinking関連の不具合だ」と当たりをつける決め手になった。
+- 1つのLLMインスタンスに全ての呼び出しを任せるのではなく、「自由記述の生成」
+  と「JSON構造化出力」のように性質が異なる呼び出しごとに設定を変えた別の
+  インスタンスを使い分ける、という設計は覚えておくと応用が効く。
+
+### 落とし穴: router_llmに切り替えても構造化出力が壊れることがある
+
+前項の対策(thinking無効化と構造化出力用LLMの分離)を入れた後も、
+`exercises/step2_ex1_three_way_supervisor.py`の`supervisor_node`で同じ
+`OutputParserException`が再発しました。今度のエラーメッセージ(`llm_output`)を
+見ると、JSONではなく直前のWriterが書いたレポート本文の続きのような自由文が
+返っており、`with_structured_output`が期待する`json_schema`による制約付き
+生成そのものが機能していない状態でした。
+
+`langchain-ollama`のドキュメントを確認すると、`with_structured_output`は
+デフォルトで`method="json_schema"`(Ollamaの構造化出力API相当)を使う設計に
+なっていますが、Qwen3のthinking機構との相性問題は複数のプロジェクト
+(Ollama本体、vLLM、SGLangなど)で報告されており、パラメータの組み合わせを
+変えるだけでは確実に解消できない、という結論に至りました。
+
+そこで方針を変え、**「LLMの構造化出力は失敗することがある」という前提に立ち、
+失敗してもクラッシュしない安全装置**を`supervisor_node`と`critic_node`の
+両方に追加しました。これはStep4で`report_approved`フラグや
+`route_from_supervisor`ガードを導入したときと同じ考え方の応用です。
+
+```python
+def _rule_based_route(state: State) -> str:
+    """LLMの構造化出力(JSON)が失敗したときの、決定的な代替ルーティング。
+    SUPERVISOR_PROMPTに書いてある判断基準と同じロジックをコードでも再現している。"""
+    contents = [str(getattr(m, "content", "")) for m in state["messages"]]
+    if not any(c.startswith("[Researcher]") for c in contents):
+        return "Researcher"
+    if not any(c.startswith("[Writer]") for c in contents):
+        return "Writer"
+    if not any(c.startswith("[FactChecker]") for c in contents):
+        return "FactChecker"
+    return "FINISH"
+
+
+def supervisor_node(state: State) -> State:
+    messages = [("system", SUPERVISOR_PROMPT)] + state["messages"]
+    try:
+        decision = router_llm.with_structured_output(RouteDecision).invoke(messages)
+        return {"next": decision.next}
+    except Exception as e:
+        print(f"[supervisor] 構造化出力の解析に失敗しました: {e}", flush=True)
+        fallback = _rule_based_route(state)
+        return {"next": fallback}
+```
+
+Criticの`CriticVerdict`(承認/差し戻し判定)についても同様に、構造化出力が
+失敗した場合は安全側(`approved=False`、つまり差し戻し)にフォールバックする
+ようにしています。`revision_count`の上限ガードが既にあるため、フォールバックが
+連続してもいずれ強制承認されて処理が進みます。
+
+**このエピソードから学べること**
+
+- 「thinkingを無効化する」「専用のLLMインスタンスに分ける」といった1つ1つの
+  対策を積んでも、ローカルの小さいモデル特有の不安定さを100%は解消できない
+  ことがある。特にライブラリ/プロバイダ側の既知の不具合が絡む場合、
+  パラメータ調整だけで確実な解決を目指すよりも、**失敗を前提にした防御的な
+  実装**に切り替える方が早く安定することがある。
+- LLMに構造化出力(JSON)を任せる設計では、`try/except`で失敗を捕まえ、
+  会話履歴の状態から機械的に代替の判断を導く「ルールベースのフォールバック」を
+  用意しておくと、本番相当の堅牢性に近づけられる。SUPERVISOR_PROMPTに書いた
+  判断基準は、実はそのままコードのif文としても再現できることが多い。
+- Critic(構造化出力で承認/却下を判定する箇所)についても、失敗時は
+  「安全側(承認しない)」に倒すのが定石。過度に楽観的なデフォルト
+  (例: 失敗時に自動承認)は品質チェックの意味を失わせてしまう。
+
 ### このセクションで参照すべきドキュメント
 
 - [ChatOllama(langchain-ollama)](https://docs.langchain.com/oss/python/integrations/chat/ollama)
 - [Ollama公式サイト(モデル一覧・pullコマンド)](https://ollama.com/library)
+- [Ollama Thinking(thinkingパラメータの公式ドキュメント)](https://docs.ollama.com/capabilities/thinking)
+- [ollama/ollama#10929: Ollama produces invalid JSON when using thinking mode with structured output](https://github.com/ollama/ollama/issues/10929)
+- [`ChatOllama.with_structured_output` リファレンス(method引数の説明)](https://reference.langchain.com/python/langchain-ollama/chat_models/ChatOllama/with_structured_output)
 
 ---
 

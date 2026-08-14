@@ -50,7 +50,7 @@ class State(TypedDict):
 search_tool = TavilySearchResults(max_results=3)
 tools = [search_tool]
 
-llm = ChatOllama(model="qwen3:30b", temperature=0)
+llm = ChatOllama(model="qwen3:8b", temperature=0, model_kwargs={"think": False})
 llm_with_tools = llm.bind_tools(tools)
 
 

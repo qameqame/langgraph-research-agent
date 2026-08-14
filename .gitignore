@@ -18,6 +18,9 @@ env/
 # OS
 .DS_Store
 
+# sed編集時の一時バックアップ
+*.bak
+
 # エディタ
 .vscode/
 .idea/

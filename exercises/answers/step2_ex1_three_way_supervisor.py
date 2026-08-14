@@ -19,7 +19,13 @@ load_dotenv()
 
 MEMBERS = ["Researcher", "Writer", "FactChecker"]
 
-llm = ChatOllama(model="qwen3:30b", temperature=0)
+llm = ChatOllama(model="qwen3:8b", temperature=0, model_kwargs={"think": False})
+
+# with_structured_output(JSON構造化出力)はthink無効化と相性が悪く、
+# 無効なJSONを返すことがある(Ollama/Qwen3の既知の問題)。
+# 構造化出力が必要な呼び出し(Supervisorのルーティング判断)には
+# thinkingを有効なままにした専用のLLMインスタンスを使う。
+router_llm = ChatOllama(model="qwen3:8b", temperature=0)
 
 # ローカルLLM(Ollama)は今の日付を知らないため、明示的に伝えておく
 # (伝えないと「学習データの頃が現在」だと誤解し、検索すべき場面で検索しない等の
@@ -52,10 +58,35 @@ SUPERVISOR_PROMPT = f"""あなたはリサーチ&レポート作成チームの�
 """
 
 
+def _rule_based_route(state: State) -> str:
+    """LLMの構造化出力(JSON)が失敗したときの、決定的な代替ルーティング。
+    会話履歴に何が積まれているかを機械的にチェックする
+    (SUPERVISOR_PROMPTに書いてある判断基準と同じロジックをコードでも再現している)。"""
+    contents = [str(getattr(m, "content", "")) for m in state["messages"]]
+    if not any(c.startswith("[Researcher]") for c in contents):
+        return "Researcher"
+    if not any(c.startswith("[Writer]") for c in contents):
+        return "Writer"
+    if not any(c.startswith("[FactChecker]") for c in contents):
+        return "FactChecker"
+    return "FINISH"
+
+
 def supervisor_node(state: State) -> State:
     messages = [("system", SUPERVISOR_PROMPT)] + state["messages"]
-    decision = llm.with_structured_output(RouteDecision).invoke(messages)
-    return {"next": decision.next}
+    try:
+        decision = router_llm.with_structured_output(RouteDecision).invoke(messages)
+        return {"next": decision.next}
+    except Exception as e:
+        # qwen3:8bのような小さいモデルは、会話履歴が長くなると構造化出力(JSON)を
+        # 正しく生成できず、レポート本文の続きを書こうとしてしまうことがある
+        # (Ollama/Qwen3のjson_schema構造化出力まわりの既知の不安定さ)。
+        # LLMが失敗した場合はクラッシュさせず、会話履歴から機械的に次のノードを
+        # 決めるルールベースの代替ルーティングにフォールバックする。
+        print(f"[supervisor] 構造化出力の解析に失敗しました: {e}", flush=True)
+        fallback = _rule_based_route(state)
+        print(f"[supervisor] ルールベースのフォールバックで next={fallback} を選択します", flush=True)
+        return {"next": fallback}
 
 
 search_tool = TavilySearchResults(max_results=3)
@@ -72,14 +103,39 @@ def researcher_node(state: State) -> State:
     return {"messages": [("ai", f"[Researcher]\n{result['messages'][-1].content}")]}
 
 
+MIN_REPORT_CHARS = 200  # Writerの応答がこれより短い場合は「全文でない」とみなして再試行する
+MIN_FACTCHECK_CHARS = 10  # FactCheckerの応答がこれより短い(=ほぼ空)場合は再試行する
+MAX_RETRY_ATTEMPTS = 2
+
+
 def writer_node(state: State) -> State:
-    prompt = [
+    base_prompt = [
         ("system", TODAY_NOTE + "\n\n"
                    "あなたはレポート執筆の専門エージェントです。会話履歴のリサーチ結果を元に、"
-                   "簡潔で読みやすい日本語レポートを作成してください。"),
+                   "簡潔で読みやすい日本語レポートを作成してください。\n"
+                   "重要: タイトル・本文・結論を含むレポート全文を、省略せずに出力してください。"),
         *state["messages"],
     ]
-    response = llm.invoke(prompt)
+    response = llm.invoke(base_prompt)
+    attempts = 1
+    # 小さいモデルは、指示通り「全文」を書かず短い応答で終わらせてしまうことがある。
+    # 文字数で機械的に検証し、短すぎれば指示を強めて再試行する(Step4と同じパターン)。
+    while len(response.content) < MIN_REPORT_CHARS and attempts < MAX_RETRY_ATTEMPTS:
+        print(f"[Writer] 応答が{len(response.content)}文字と短すぎるため再試行します"
+              f"({attempts}/{MAX_RETRY_ATTEMPTS})", flush=True)
+        retry_prompt = base_prompt + [
+            ("ai", response.content),
+            ("human", f"直前の応答は{len(response.content)}文字しかなく、レポートとして短すぎます。"
+                      f"タイトル・本文・結論を含む完全なレポート全文を{MIN_REPORT_CHARS}文字以上で"
+                      "出力し直してください。"),
+        ]
+        response = llm.invoke(retry_prompt)
+        attempts += 1
+
+    if len(response.content) < MIN_REPORT_CHARS:
+        print(f"[Writer] 警告: {attempts}回試しても{MIN_REPORT_CHARS}文字以上の応答が"
+              "得られませんでした。得られた内容をそのまま採用します。", flush=True)
+
     return {"messages": [("ai", f"[Writer]\n{response.content}")]}
 
 
@@ -97,7 +153,28 @@ fact_checker_agent = create_react_agent(
 
 def fact_checker_node(state: State) -> State:
     result = fact_checker_agent.invoke({"messages": state["messages"]})
-    return {"messages": [("ai", f"[FactChecker]\n{result['messages'][-1].content}")]}
+    content = result["messages"][-1].content
+    attempts = 1
+    # 小さいモデルは、長い会話履歴を渡されるとReActループの最後で空/ほぼ空の
+    # 応答を返してしまうことがある。空でないことを機械的に確認し、
+    # 空だった場合は指示を強めて再試行する。
+    while len(content.strip()) < MIN_FACTCHECK_CHARS and attempts < MAX_RETRY_ATTEMPTS:
+        print(f"[FactChecker] 応答が空/短すぎる({len(content.strip())}文字)ため再試行します"
+              f"({attempts}/{MAX_RETRY_ATTEMPTS})", flush=True)
+        retry_messages = list(state["messages"]) + [
+            ("human", "直前の検証結果が空でした。検証結果を必ずテキストで出力してください。"
+                      "問題が無ければ『検証OK: 主要な主張は裏付けが取れました』とだけ出力してください。"),
+        ]
+        result = fact_checker_agent.invoke({"messages": retry_messages})
+        content = result["messages"][-1].content
+        attempts += 1
+
+    if len(content.strip()) < MIN_FACTCHECK_CHARS:
+        print(f"[FactChecker] 警告: {attempts}回試しても有効な応答が得られませんでした。"
+              "デフォルトのメッセージを使用します。", flush=True)
+        content = "(検証結果を取得できませんでした。手動で確認してください)"
+
+    return {"messages": [("ai", f"[FactChecker]\n{content}")]}
 
 
 graph_builder = StateGraph(State)

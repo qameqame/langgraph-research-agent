@@ -28,7 +28,13 @@ from pydantic import BaseModel
 load_dotenv()
 
 MEMBERS = ["Researcher", "Writer"]
-llm = ChatOllama(model="qwen3:30b", temperature=0)
+llm = ChatOllama(model="qwen3:8b", temperature=0, model_kwargs={"think": False})
+
+# with_structured_output(JSON構造化出力)はthink無効化と相性が悪く、
+# 無効なJSONを返すことがある(Ollama/Qwen3の既知の問題)。
+# 構造化出力が必要な呼び出し(Supervisorのルーティング判断)には
+# thinkingを有効なままにした専用のLLMインスタンスを使う。
+router_llm = ChatOllama(model="qwen3:8b", temperature=0)
 
 # ローカルLLM(Ollama)は今の日付を知らないため、明示的に伝えておく
 # (伝えないと「学習データの頃が現在」だと誤解し、検索すべき場面で検索しない等の
@@ -60,10 +66,36 @@ SUPERVISOR_PROMPT = f"""あなたはリサーチ&レポート作成チームの�
 """
 
 
+def _rule_based_route(state: State) -> str:
+    """LLMの構造化出力(JSON)が失敗したときの、決定的な代替ルーティング。
+    会話履歴に何が積まれているかを機械的にチェックする
+    (SUPERVISOR_PROMPTに書いてある判断基準と同じロジックをコードでも再現している)。
+    注意: これは簡易版のため、「一度FINISHした後にターン2で修正依頼が来た」
+    ケースは正しく扱えない(Writerが既にいるとFINISH扱いになってしまう)。
+    あくまでLLMが失敗した際の最終防御であり、通常はLLMの判断が優先される。"""
+    contents = [str(getattr(m, "content", "")) for m in state["messages"]]
+    if not any(c.startswith("[Researcher]") for c in contents):
+        return "Researcher"
+    if not any(c.startswith("[Writer]") for c in contents):
+        return "Writer"
+    return "FINISH"
+
+
 def supervisor_node(state: State) -> State:
     messages = [("system", SUPERVISOR_PROMPT)] + state["messages"]
-    decision = llm.with_structured_output(RouteDecision).invoke(messages)
-    return {"next": decision.next}
+    try:
+        decision = router_llm.with_structured_output(RouteDecision).invoke(messages)
+        return {"next": decision.next}
+    except Exception as e:
+        # qwen3:8bのような小さいモデルは、会話履歴が長くなると構造化出力(JSON)を
+        # 正しく生成できず、レポート本文の続きを書こうとしてしまうことがある
+        # (Ollama/Qwen3のjson_schema構造化出力まわりの既知の不安定さ)。
+        # LLMが失敗した場合はクラッシュさせず、会話履歴から機械的に次のノードを
+        # 決めるルールベースの代替ルーティングにフォールバックする。
+        print(f"[supervisor] 構造化出力の解析に失敗しました: {e}", flush=True)
+        fallback = _rule_based_route(state)
+        print(f"[supervisor] ルールベースのフォールバックで next={fallback} を選択します", flush=True)
+        return {"next": fallback}
 
 
 search_tool = TavilySearchResults(max_results=3)

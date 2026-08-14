@@ -46,7 +46,13 @@ load_dotenv()
 MEMBERS = ["Researcher", "Writer"]
 MAX_REVISIONS = 2
 
-llm = ChatOllama(model="qwen3:30b", temperature=0)
+llm = ChatOllama(model="qwen3:8b", temperature=0, model_kwargs={"think": False})
+
+# with_structured_output(JSON構造化出力)はthink無効化と相性が悪く、
+# 無効なJSONを返すことがある(Ollama/Qwen3の既知の問題)。
+# 構造化出力が必要な呼び出し(Supervisorのルーティング判断、Criticの審査)には
+# thinkingを有効なままにした専用のLLMインスタンスを使う。
+router_llm = ChatOllama(model="qwen3:8b", temperature=0)
 
 # ローカルLLM(Ollama)は今の日付を知らないため、明示的に伝えておく
 # (伝えないと「学習データの頃が現在」だと誤解し、検索すべき場面で検索しない等の
@@ -95,10 +101,42 @@ SUPERVISOR_PROMPT = f"""あなたはリサーチ&レポート作成チームの�
 """
 
 
+def _rule_based_route(state: State) -> str:
+    """LLMの構造化出力(JSON)が失敗したときの、決定的な代替ルーティング。
+    SUPERVISOR_PROMPTに書いてある判断基準と同じロジックをコードでも再現している。"""
+    contents = [str(getattr(m, "content", "")) for m in state["messages"]]
+    if not any(c.startswith("[Researcher]") for c in contents):
+        return "Researcher"
+    if not any(c.startswith("[Writer]") for c in contents):
+        return "Writer"
+    critic_approved = any(
+        c.startswith("[Critic] 自動レビュー承認。人間の確認へ回します。")
+        or c.startswith("[Critic] 修正上限回数に達したため、人間の判断に委ねます。")
+        for c in contents
+    )
+    if not critic_approved:
+        return "Writer"
+    finalized = any(c.startswith("[Human] 最終確定しました。") for c in contents)
+    if not finalized:
+        return "Writer"
+    return "FINISH"
+
+
 def supervisor_node(state: State) -> State:
     messages = [("system", SUPERVISOR_PROMPT)] + state["messages"]
-    decision = llm.with_structured_output(RouteDecision).invoke(messages)
-    return {"next": decision.next}
+    try:
+        decision = router_llm.with_structured_output(RouteDecision).invoke(messages)
+        return {"next": decision.next}
+    except Exception as e:
+        # qwen3:8bのような小さいモデルは、会話履歴が長くなると構造化出力(JSON)を
+        # 正しく生成できず、レポート本文の続きを書こうとしてしまうことがある
+        # (Ollama/Qwen3のjson_schema構造化出力まわりの既知の不安定さ)。
+        # LLMが失敗した場合はクラッシュさせず、会話履歴から機械的に次のノードを
+        # 決めるルールベースの代替ルーティングにフォールバックする。
+        print(f"[supervisor] 構造化出力の解析に失敗しました: {e}", flush=True)
+        fallback = _rule_based_route(state)
+        print(f"[supervisor] ルールベースのフォールバックで next={fallback} を選択します", flush=True)
+        return {"next": fallback}
 
 
 search_tool = TavilySearchResults(max_results=3)
@@ -168,11 +206,23 @@ def critic_node(state: State) -> State:
             "next": "human_approval",
         }
 
-    verdict = llm.with_structured_output(CriticVerdict).invoke([
-        ("system", "あなたはレポート品質を審査するCriticです。問題があればapproved=falseとし、"
-                   "具体的な改善指示をfeedbackに書いてください。"),
-        *state["messages"],
-    ])
+    try:
+        verdict = router_llm.with_structured_output(CriticVerdict).invoke([
+            ("system", "あなたはレポート品質を審査するCriticです。問題があればapproved=falseとし、"
+                       "具体的な改善指示をfeedbackに書いてください。"),
+            *state["messages"],
+        ])
+    except Exception as e:
+        # supervisor_node同様、構造化出力(JSON)の解析に失敗することがある。
+        # ここで例外を投げるとグラフ全体がクラッシュしてしまうため、
+        # 安全側(承認しない=Writerに差し戻す)にフォールバックする。
+        # revision_countの上限ガードがあるので、無限ループにはならない。
+        print(f"[Critic] 構造化出力の解析に失敗しました: {e}", flush=True)
+        print("[Critic] 安全側のフォールバックとして差し戻し扱いにします", flush=True)
+        verdict = CriticVerdict(
+            approved=False,
+            feedback="(自動審査の構造化出力に失敗したため、内容を再確認して出力し直してください)",
+        )
 
     if verdict.approved:
         return {"messages": [("ai", "[Critic] 自動レビュー承認。人間の確認へ回します。")], "next": "human_approval"}
